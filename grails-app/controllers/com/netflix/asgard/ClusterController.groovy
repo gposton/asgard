@@ -18,22 +18,24 @@ package com.netflix.asgard
 import com.amazonaws.services.autoscaling.model.AutoScalingGroup
 import com.amazonaws.services.autoscaling.model.LaunchConfiguration
 import com.amazonaws.services.autoscaling.model.ScheduledUpdateGroupAction
+import com.amazonaws.services.autoscaling.model.Tag
+import com.amazonaws.services.autoscaling.model.TagDescription
 import com.amazonaws.services.ec2.model.AvailabilityZone
 import com.amazonaws.services.elasticloadbalancing.model.LoadBalancerDescription
 import com.amazonaws.services.simpleworkflow.flow.ManualActivityCompletionClient
-import com.amazonaws.services.simpleworkflow.model.WorkflowExecution
 import com.google.common.collect.Sets
-import com.netflix.asgard.model.AutoScalingGroupBeanOptions
-import com.netflix.asgard.deployment.DeploymentWorkflowOptions
 import com.netflix.asgard.deployment.DeploymentWorkflow
-import com.netflix.asgard.model.LaunchConfigurationBeanOptions
+import com.netflix.asgard.deployment.DeploymentWorkflowOptions
 import com.netflix.asgard.deployment.ProceedPreference
+import com.netflix.asgard.model.AutoScalingGroupBeanOptions
 import com.netflix.asgard.model.AutoScalingGroupData
 import com.netflix.asgard.model.AutoScalingProcessType
 import com.netflix.asgard.model.InstancePriceType
+import com.netflix.asgard.model.LaunchConfigurationBeanOptions
 import com.netflix.asgard.model.ScalingPolicyData
 import com.netflix.asgard.model.SubnetTarget
 import com.netflix.asgard.model.Subnets
+import com.netflix.asgard.model.SwfWorkflowTags
 import com.netflix.asgard.push.Cluster
 import com.netflix.asgard.push.CommonPushOptions
 import com.netflix.asgard.push.GroupActivateOperation
@@ -75,7 +77,7 @@ class ClusterController {
                 appNames.contains(Relationships.appNameFromGroupName(cluster.name))
             }
         }
-        clusterObjects = clusterObjects.sort{ it.name.toLowerCase() }
+        clusterObjects = clusterObjects.sort { it.name.toLowerCase() }
         withFormat {
             html { [clusters: clusterObjects, appNames: appNames] }
             xml {
@@ -136,7 +138,7 @@ class ClusterController {
                     Subnets subnets = awsEc2Service.getSubnets(userContext)
                     List<String> subnetIds = Relationships.subnetIdsFromVpcZoneIdentifier(lastGroup.vpcZoneIdentifier)
                     String subnetPurpose = subnets.coerceLoneOrNoneFromIds(subnetIds)?.purpose
-                    String vpcId = subnets.mapPurposeToVpcId()[subnetPurpose] ?: ''
+                    String vpcId = subnets.getVpcIdForSubnetPurpose(subnetPurpose) ?: ''
                     List<String> selectedLoadBalancers = Requests.ensureList(
                             params["selectedLoadBalancersForVpcId${vpcId}"]) ?: lastGroup.loadBalancerNames
                     log.debug """ClusterController.show for Cluster '${cluster.name}' Load Balancers from last Group: \
@@ -145,6 +147,7 @@ ${lastGroup.loadBalancerNames}"""
                             SubnetTarget.EC2).sort()
                     Map<String, Collection<String>> zonesByPurpose = subnets.groupZonesByPurpose(
                             availabilityZones*.zoneName, SubnetTarget.EC2)
+					List<TagDescription> tags = lastGroup.getTags()
                     attributes.putAll([
                             cluster: cluster,
                             runningTasks: runningTasks,
@@ -161,7 +164,8 @@ ${lastGroup.loadBalancerNames}"""
                             loadBalancersGroupedByVpcId: loadBalancers.groupBy { it.VPCId },
                             selectedLoadBalancers: selectedLoadBalancers,
                             spotUrl: configService.spotUrl,
-                            pricing: params.pricing ?: attributes.pricing
+                            pricing: params.pricing ?: attributes.pricing,
+							tags:tags
                     ])
                     attributes
                 }
@@ -187,15 +191,15 @@ ${lastGroup.loadBalancerNames}"""
 
     def result = { render view: '/common/result' }
 
-    def proceedWithDeployment(String taskToken, String runId, String workflowId) {
-        completeDeployment(taskToken, runId, workflowId, true)
+    def proceedWithDeployment(String taskToken, String id) {
+        completeDeployment(taskToken, id, true)
     }
 
-    def rollbackDeployment(String taskToken, String runId, String workflowId) {
-        completeDeployment(taskToken, runId, workflowId, false)
+    def rollbackDeployment(String taskToken, String id) {
+        completeDeployment(taskToken, id, false)
     }
 
-    private void completeDeployment(String taskToken, String runId, String workflowId, boolean shouldProceed) {
+    private void completeDeployment(String taskToken, String taskId, boolean shouldProceed) {
         ManualActivityCompletionClient manualActivityCompletionClient = flowService.
                 getManualActivityCompletionClient(taskToken)
         try {
@@ -204,7 +208,7 @@ ${lastGroup.loadBalancerNames}"""
         } catch (Exception e) {
             flash.message = "Deployment failed: ${e.toString()}"
         }
-        redirect([controller: 'task', action: 'show', params: [runId: runId, workflowId: workflowId]])
+        redirect([controller: 'task', action: 'show', id: taskId])
     }
 
     def prepareDeployment(String id) {
@@ -216,17 +220,16 @@ ${lastGroup.loadBalancerNames}"""
         attributes?.putAll([
                 deploymentWorkflowOptions: new DeploymentWorkflowOptions(
                         notificationDestination: params.notificationDestination ?: email,
-                        delayDurationMinutes: params.delayDurationMinutes ?: 0,
+                        delayDurationMinutes: params.int('delayDurationMinutes') ?: 0,
                         doCanary: Boolean.parseBoolean(params.doCanary),
-                        canaryCapacity: params.canaryCount ?: 1,
-                        canaryStartUpTimeoutMinutes: params.canaryStartUpTimeoutMinutes ?: 30,
-                        canaryAssessmentDurationMinutes: params.canaryAssessmentDurationMinutes ?: 60,
+                        canaryCapacity: params.int('canaryCount') ?: 1,
+                        canaryStartUpTimeoutMinutes: params.int('canaryStartUpTimeoutMinutes') ?: 30,
+                        canaryJudgmentPeriodMinutes: params.int('canaryJudgmentPeriodMinutes') ?: 60,
                         scaleUp: ProceedPreference.parse(params.scaleUp),
-                        desiredCapacityStartUpTimeoutMinutes: params.desiredCapacityStartUpTimeoutMinutes ?: 40,
-                        desiredCapacityAssessmentDurationMinutes: params.
-                                desiredCapacityAssessmentDurationMinutes ?: 120,
+                        desiredCapacityStartUpTimeoutMinutes: params.int('desiredCapacityStartUpTimeoutMinutes') ?: 40,
+                        desiredCapacityJudgmentPeriodMinutes: params.int('desiredCapacityJudgmentPeriodMinutes') ?: 120,
                         disablePreviousAsg: ProceedPreference.parse(params.disablePreviousAsg),
-                        fullTrafficAssessmentDurationMinutes: params.fullTrafficAssessmentDurationMinutes ?: 240,
+                        fullTrafficJudgmentPeriodMinutes: params.int('fullTrafficJudgmentPeriodMinutes') ?: 240,
                         deletePreviousAsg: ProceedPreference.parse(params.deletePreviousAsg)
                 )
         ])
@@ -265,7 +268,7 @@ ${lastGroup.loadBalancerNames}"""
         Subnets subnets = awsEc2Service.getSubnets(userContext)
         List<String> subnetIds = Relationships.subnetIdsFromVpcZoneIdentifier(lastGroup.vpcZoneIdentifier)
         String subnetPurpose = subnets.coerceLoneOrNoneFromIds(subnetIds)?.purpose
-        String vpcId = subnets.mapPurposeToVpcId()[subnetPurpose] ?: ''
+        String vpcId = subnets.getVpcIdForSubnetPurpose(subnetPurpose) ?: ''
         List<String> selectedLoadBalancers = Requests.ensureList(
                 params["selectedLoadBalancersForVpcId${vpcId}"]) ?: lastGroup.loadBalancerNames
         List<String> subnetPurposes = subnets.getPurposesForZones(availabilityZones*.zoneName,
@@ -287,30 +290,46 @@ ${lastGroup.loadBalancerNames}"""
     }
 
     def deploy(DeployCommand cmd) {
+        UserContext userContext = UserContext.of(request)
         if (cmd.hasErrors()) {
-            chain(action: 'prepareDeployment', model: [cmd:cmd], params: params)
+            flash.message = "Cluster '${cmd.clusterName}' is invalid."
+            chain(action: 'prepareDeployment', model: [cmd: cmd], params: params)
+            return
+        }
+        Cluster cluster = awsAutoScalingService.getCluster(userContext, cmd.clusterName)
+        if (cluster.size() != 1) {
+            flash.message = "Cluster '${cmd.clusterName}' should only have one ASG to enable automatic deployment."
+            chain(action: 'prepareDeployment', model: [cmd: cmd], params: params, id: cmd.clusterName)
+            return
+        }
+        AutoScalingGroupData group = cluster.last()
+        if ( group.isLaunchingSuspended() ||
+             group.isTerminatingSuspended() ||
+             group.isAddingToLoadBalancerSuspended()
+        ) {
+            flash.message = "ASG in cluster '${cmd.clusterName}' should be receiving traffic to enable automatic deployment."
+            chain(action: 'prepareDeployment', model: [cmd: cmd], params: params, id: cmd.clusterName)
             return
         }
         DeploymentWorkflowOptions deploymentOptions = new DeploymentWorkflowOptions()
         bindData(deploymentOptions, params)
         deploymentOptions.clusterName = cmd.clusterName
 
-        UserContext userContext = UserContext.of(request)
-        String appName = Relationships.appNameFromGroupName(cmd.clusterName)
-        String email = applicationService.getEmailFromApp(userContext, appName)
         if (params.createAsgOnly) {
+            String appName = Relationships.appNameFromGroupName(cmd.clusterName)
+            String email = applicationService.getEmailFromApp(userContext, appName)
             deploymentOptions.with {
                 notificationDestination = email
                 delayDurationMinutes = 0
                 doCanary = false
                 desiredCapacityStartUpTimeoutMinutes = 30
-                desiredCapacityAssessmentDurationMinutes = 0
+                desiredCapacityJudgmentPeriodMinutes = 0
                 disablePreviousAsg = ProceedPreference.No
             }
         }
         String subnetPurpose = params.subnetPurpose
         Subnets subnets = awsEc2Service.getSubnets(userContext)
-        String vpcId = subnets.mapPurposeToVpcId()[subnetPurpose] ?: ''
+        String vpcId = subnets.getVpcIdForSubnetPurpose(subnetPurpose) ?: ''
         List<String> loadBalancerNames = Requests.ensureList(params["selectedLoadBalancersForVpcId${vpcId}"] ?:
             params["selectedLoadBalancers"])
 
@@ -349,9 +368,8 @@ ${lastGroup.loadBalancerNames}"""
         def client = flowService.getNewWorkflowClient(userContext, DeploymentWorkflow,
                 new Link(EntityType.cluster, cmd.clusterName))
         client.asWorkflow().deploy(userContext, deploymentOptions, lcOverrides, asgOverrides)
-        WorkflowExecution workflowExecution = client.workflowExecution
-        redirect(controller: 'task', action: 'show', params: [runId: workflowExecution.runId,
-                workflowId: workflowExecution.workflowId])
+        SwfWorkflowTags tags = (SwfWorkflowTags) client.workflowTags
+        redirect(controller: 'task', action: 'show', id: tags.id)
     }
 
     @SuppressWarnings("GroovyAssignabilityCheck")
@@ -376,7 +394,7 @@ ${lastGroup.loadBalancerNames}"""
             List<String> termPolicies = Requests.ensureList(params.terminationPolicy)
             Subnets subnets = awsEc2Service.getSubnets(userContext)
             String subnetPurpose = params.subnetPurpose
-            String vpcId = subnets.mapPurposeToVpcId()[subnetPurpose] ?: ''
+            String vpcId = subnets.getVpcIdForSubnetPurpose(subnetPurpose) ?: ''
             List<String> loadBalancerNames = Requests.ensureList(params["selectedLoadBalancersForVpcId${vpcId}"] ?:
                     params["selectedLoadBalancers"])
             // Availability zones default to the last group's value since this field is required.
@@ -415,13 +433,19 @@ ${loadBalancerNames}"""
 Group: ${lastGroup.loadBalancerNames}"""
             boolean ebsOptimized = params.containsKey('ebsOptimized') ? params.ebsOptimized?.toBoolean() :
                 lastLaunchConfig.ebsOptimized
+				
+			List<Tag> tags = convertTags(nextGroupName)
+
             if (params.noOptionalDefaults != 'true') {
                 securityGroups = securityGroups ?: lastLaunchConfig.securityGroups
                 termPolicies = termPolicies ?: lastGroup.terminationPolicies
                 loadBalancerNames = loadBalancerNames ?: lastGroup.loadBalancerNames
                 vpcZoneIdentifier = vpcZoneIdentifier ?: subnets.constructNewVpcZoneIdentifierForZones(
                         lastGroup.vpcZoneIdentifier, selectedZones)
+				tags = lastGroup.tags
             }
+			
+			
             log.debug """ClusterController.createNextGroup for Cluster '${cluster.name}' Load Balancers for next \
 Group: ${loadBalancerNames}"""
             GroupCreateOptions options = new GroupCreateOptions(
@@ -455,12 +479,24 @@ Group: ${loadBalancerNames}"""
                     scheduledActions: newScheduledActions,
                     vpcZoneIdentifier: vpcZoneIdentifier,
                     spotPrice: spotPrice,
-                    ebsOptimized: ebsOptimized
+                    ebsOptimized: ebsOptimized,
+					tags: tags
             )
             def operation = pushService.startGroupCreate(options)
             flash.message = "${operation.task.name} has been started."
             redirectToTask(operation.taskId)
         }
+    }
+	
+	private List<Tag> convertTags(String nextGroupName){
+		List<Tag> tags = []
+		if (params.tags) {
+			params.tags.value.each { key, value ->
+				Tag t = new Tag(key:key, value:value, propagateAtLaunch:params['tags.props.' + key] == 'on' ? true:false, resourceId:nextGroupName, resourceType:"auto-scaling-group")
+				tags.add(t)
+			}
+		}
+		tags
     }
 
     private int convertToIntOrUseDefault(String value, Integer defaultValue) {

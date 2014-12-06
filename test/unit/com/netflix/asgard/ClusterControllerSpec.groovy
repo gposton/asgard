@@ -18,6 +18,7 @@ package com.netflix.asgard
 import com.amazonaws.services.autoscaling.model.AutoScalingGroup
 import com.amazonaws.services.autoscaling.model.Instance
 import com.amazonaws.services.autoscaling.model.LaunchConfiguration
+import com.amazonaws.services.autoscaling.model.Tag
 import com.netflix.asgard.model.AutoScalingGroupData
 import com.netflix.asgard.model.AutoScalingGroupHealthCheckType
 import com.netflix.asgard.model.AutoScalingGroupMixin
@@ -30,6 +31,7 @@ import com.netflix.asgard.push.GroupCreateOperation
 import com.netflix.asgard.push.GroupCreateOptions
 import grails.test.mixin.TestFor
 import spock.lang.Specification
+import spock.lang.Unroll
 
 @SuppressWarnings(["GroovyAssignabilityCheck"])
 @TestFor(ClusterController)
@@ -45,12 +47,15 @@ class ClusterControllerSpec extends Specification {
             subnet('subnet-3', 'us-east-1e', 'internal'),
             subnet('subnet-4', 'us-east-1e', 'external'),
     ])
+	
+	
     final AutoScalingGroup asg = new AutoScalingGroup(autoScalingGroupName: 'helloworld-example-v015',
         minSize: 3, desiredCapacity: 5, maxSize: 7, healthCheckGracePeriod: 42, defaultCooldown: 360,
         launchConfigurationName: 'helloworld-lc', healthCheckType: AutoScalingGroupHealthCheckType.EC2,
         instances: [new Instance(instanceId: 'i-6ef9f30e'), new Instance(instanceId: 'i-95fe1df6')],
         availabilityZones: ['us-east-1c'], loadBalancerNames: ['hello-elb'], terminationPolicies: ['hello-tp'],
-        vPCZoneIdentifier: 'subnet-1')
+        vPCZoneIdentifier: 'subnet-1',
+		tags: [new Tag(resourceType:'auto-scaling-group', resourceId:'helloworld-example-v015',key:'test',value:'lastTag')])
     final LaunchConfiguration launchConfiguration = new LaunchConfiguration(imageId: 'lastImageId',
             instanceType: 'lastInstanceType', keyName: 'lastKeyName', securityGroups: ['sg-123', 'sg-456'],
             iamInstanceProfile: 'lastIamProfile', spotPrice: '1.23')
@@ -106,8 +111,8 @@ class ClusterControllerSpec extends Specification {
                     AutoScalingGroupData.from(new AutoScalingGroup(autoScalingGroupName: 'helloworld-example-v014',
                             instances: [new Instance(instanceId: 'i-8ee4eeee')]), [:], [], [:], []),
                     AutoScalingGroupData.from(new AutoScalingGroup(autoScalingGroupName: 'helloworld-example-v015',
-                            instances: [new Instance(instanceId: 'i-6ef9f30e'), new Instance(instanceId: 'i-95fe1df6')]),
-                            [:], [], [:], [])
+                            instances: [new Instance(instanceId: 'i-6ef9f30e'),
+                                    new Instance(instanceId: 'i-95fe1df6')]), [:], [], [:], [])
             ])
         }
         controller.params.id = 'helloworld-example'
@@ -165,6 +170,7 @@ class ClusterControllerSpec extends Specification {
                 assert vpcZoneIdentifier == 'subnet-1'
                 assert iamInstanceProfile == 'lastIamProfile'
                 assert spotPrice == '1.23'
+				assert tags["value"] == ['lastTag']
             }
             true
         }) >> { args ->
@@ -222,6 +228,7 @@ class ClusterControllerSpec extends Specification {
         controller.awsAutoScalingService.getLaunchConfiguration(_, 'helloworld-lc') >> launchConfiguration
         controller.params.with() {
             name = 'helloworld-example'
+			noOptionalDefaults = 'true'
             selectedSecurityGroups = 'sg-789'
             selectedZones = 'us-east-1e'
             terminationPolicy = 'hello-tp2'
@@ -239,6 +246,7 @@ class ClusterControllerSpec extends Specification {
             keyName = 'newKeyName'
             subnetPurpose = 'external'
             pricing = InstancePriceType.ON_DEMAND.name()
+			tags = [value:[test:'newTag']]
         }
 
         when:
@@ -265,6 +273,7 @@ class ClusterControllerSpec extends Specification {
                 assert vpcZoneIdentifier == 'subnet-4'
                 assert iamInstanceProfile == 'newIamProfile'
                 assert spotPrice == null
+				assert tags["value"] == ['newTag']
             }
             true
         }) >> { args ->
@@ -273,5 +282,66 @@ class ClusterControllerSpec extends Specification {
                 it
             }
         }
+    }
+
+    def 'deploy should fail on an invalid cluster name'() {
+        DeployCommand cmd = Mock(DeployCommand)
+        1 * cmd.hasErrors() >> true
+
+        when:
+        controller.deploy(cmd)
+
+        then:
+        flash.chainModel.cmd == cmd
+        response.redirectedUrl == '/cluster/prepareDeployment'
+    }
+
+    def 'deploy should fail when the cluster has two autoscaling group'() {
+        DeployCommand cmd = new DeployCommand(clusterName: 'helloworld')
+        controller.awsAutoScalingService.getCluster(_, 'helloworld') >> {
+            new Cluster([
+                    AutoScalingGroupData.from(new AutoScalingGroup(autoScalingGroupName: 'helloworld-example-v014',
+                            instances: [new Instance(instanceId: 'i-8ee4eeee')]), [:], [], [:], []),
+                    AutoScalingGroupData.from(new AutoScalingGroup(autoScalingGroupName: 'helloworld-example-v015',
+                            instances: [new Instance(instanceId: 'i-6ef9f30e'), new Instance(instanceId: 'i-95fe1df6')]),
+                            [:], [], [:], [])
+            ])
+        }
+
+        when:
+        controller.deploy(cmd)
+
+        then:
+        flash.message == "Cluster 'helloworld' should only have one ASG to enable automatic deployment."
+        flash.chainModel.cmd == cmd
+        response.redirectedUrl == '/cluster/prepareDeployment/helloworld'
+    }
+
+    @Unroll
+    def 'deploy should fail when the current cluster is not accepting traffic'() {
+        DeployCommand cmd = new DeployCommand(clusterName: 'helloworld')
+        Cluster cluster = Mock(Cluster)
+        AutoScalingGroupData asg = Mock(AutoScalingGroupData)
+        controller.awsAutoScalingService.getCluster(_, 'helloworld') >> cluster
+        cluster.size() >> 1
+        cluster.last() >> asg
+        asg.isLaunchingSuspended() >> launchSuspended
+        asg.isTerminatingSuspended() >> terminateSuspended
+        asg.isAddingToLoadBalancerSuspended() >> addToLoadBalancerSuspended
+
+        when:
+        controller.deploy(cmd)
+
+        then:
+        flash.message == "ASG in cluster 'helloworld' should be receiving traffic to enable automatic deployment."
+        flash.chainModel.cmd == cmd
+        response.redirectedUrl == '/cluster/prepareDeployment/helloworld'
+
+        where:
+        launchSuspended | terminateSuspended | addToLoadBalancerSuspended
+        true            | true               | true
+        true            | false              | false
+        false           | true               | false
+        false           | false              | true
     }
 }

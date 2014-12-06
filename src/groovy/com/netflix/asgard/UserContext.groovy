@@ -15,12 +15,12 @@
  */
 package com.netflix.asgard
 
+import com.fasterxml.jackson.annotation.JsonCreator
+import com.fasterxml.jackson.annotation.JsonProperty
 import groovy.transform.Immutable
 import javax.servlet.http.HttpServletRequest
 import org.apache.shiro.SecurityUtils
 import org.apache.shiro.UnavailableSecurityManagerException
-import org.codehaus.jackson.annotate.JsonCreator
-import org.codehaus.jackson.annotate.JsonProperty
 
 @Immutable final class UserContext {
 
@@ -84,7 +84,7 @@ import org.codehaus.jackson.annotate.JsonProperty
      * @param region the AWS region on which the current operation should execute
      * @return UserContext a new context object
      */
-    static auto(Region region) {
+    static auto(Region region = Region.defaultRegion()) {
         new UserContext(region: region, internalAutomation: true)
     }
 

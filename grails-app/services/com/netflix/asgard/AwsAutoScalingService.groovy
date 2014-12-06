@@ -22,10 +22,12 @@ import com.amazonaws.services.autoscaling.model.Alarm
 import com.amazonaws.services.autoscaling.model.AutoScalingGroup
 import com.amazonaws.services.autoscaling.model.BlockDeviceMapping
 import com.amazonaws.services.autoscaling.model.CreateAutoScalingGroupRequest
+import com.amazonaws.services.autoscaling.model.CreateOrUpdateTagsRequest
 import com.amazonaws.services.autoscaling.model.DeleteAutoScalingGroupRequest
 import com.amazonaws.services.autoscaling.model.DeleteLaunchConfigurationRequest
 import com.amazonaws.services.autoscaling.model.DeletePolicyRequest
 import com.amazonaws.services.autoscaling.model.DeleteScheduledActionRequest
+import com.amazonaws.services.autoscaling.model.DeleteTagsRequest
 import com.amazonaws.services.autoscaling.model.DescribeAutoScalingGroupsRequest
 import com.amazonaws.services.autoscaling.model.DescribeAutoScalingGroupsResult
 import com.amazonaws.services.autoscaling.model.DescribeLaunchConfigurationsRequest
@@ -47,6 +49,7 @@ import com.amazonaws.services.autoscaling.model.ResumeProcessesRequest
 import com.amazonaws.services.autoscaling.model.ScalingPolicy
 import com.amazonaws.services.autoscaling.model.ScheduledUpdateGroupAction
 import com.amazonaws.services.autoscaling.model.SuspendProcessesRequest
+import com.amazonaws.services.autoscaling.model.Tag
 import com.amazonaws.services.autoscaling.model.TerminateInstanceInAutoScalingGroupRequest
 import com.amazonaws.services.autoscaling.model.UpdateAutoScalingGroupRequest
 import com.amazonaws.services.cloudwatch.model.MetricAlarm
@@ -89,22 +92,17 @@ class AwsAutoScalingService implements CacheInitializer, InitializingBean {
     def awsCloudWatchService
     def awsEc2Service
     def awsLoadBalancerService
-    def awsSimpleDbService
     Caches caches
     def cloudReadyService
     def configService
     def discoveryService
-    def emailerService
+    def idService
     def launchTemplateService
     def mergedInstanceService
     def pushService
     def taskService
     def spotInstanceRequestService
     ThreadScheduler threadScheduler
-
-    /** The location of the sequence number in SimpleDB */
-    final SimpleDbSequenceLocator sequenceLocator = new SimpleDbSequenceLocator(region: Region.defaultRegion(),
-            domainName: 'CLOUD_POLICY_SEQUENCE', itemName: 'policy_id', attributeName: 'value')
 
     final AwsResultsRetriever scalingPolicyRetriever = new AwsResultsRetriever<ScalingPolicy, DescribePoliciesRequest,
             DescribePoliciesResult>() {
@@ -702,12 +700,7 @@ class AwsAutoScalingService implements CacheInitializer, InitializingBean {
     }
 
     String nextPolicyId(UserContext userContext) {
-        try {
-            return awsSimpleDbService.incrementAndGetSequenceNumber(userContext, sequenceLocator)
-        } catch (Exception e) {
-            emailerService.sendExceptionEmail(e.toString(), e)
-            return UUID.randomUUID().toString()
-        }
+        idService.nextId(userContext, SimpleDbSequenceLocator.Policy)
     }
 
     /**
@@ -756,16 +749,16 @@ class AwsAutoScalingService implements CacheInitializer, InitializingBean {
     }
 
     /**
-     * Analyze an ASG and determine if it is healthy.
+     * Analyze an ASG and determine if it is operational.
      *
      * @param userContext who made the call, why, and in what region
      * @param asgName name of the ASG
      * @param expectedInstanceCount number of instances that are expected
-     * @return a String describing why the ASG is unhealthy or null if it is healthy
+     * @return textual description of the reason the ASG is not operational, or an empty String if it is
      */
-    String reasonAsgIsUnhealthy(UserContext userContext, String asgName, int expectedInstanceCount) {
+    String reasonAsgIsNotOperational(UserContext userContext, String asgName, int expectedInstanceCount) {
         if (expectedInstanceCount == 0) {
-            return null
+            return ''
         }
         AutoScalingGroup asg = getAutoScalingGroup(userContext, asgName)
         if (!asg) {
@@ -777,18 +770,31 @@ class AwsAutoScalingService implements CacheInitializer, InitializingBean {
         if (asg.instances.find { it.lifecycleState != LifecycleState.InService.name() }) {
             return 'Waiting for instances to be in service.'
         }
-        List<ApplicationInstance> applicationInstances = discoveryService.getAppInstancesByIds(userContext,
-                asg.instances*.instanceId)
-        if (applicationInstances.size() < expectedInstanceCount) {
-            return 'Waiting for Eureka data about instances.'
+        if (configService.getRegionalDiscoveryServer(userContext.region)) {
+            List<ApplicationInstance> applicationInstances = discoveryService.getAppInstancesByIds(userContext,
+                    asg.instances*.instanceId)
+            if (applicationInstances.size() < expectedInstanceCount) {
+                return 'Waiting for Eureka data about instances.'
+            }
+            if (applicationInstances.find { it.status != EurekaStatus.UP.name() }) {
+                return 'Waiting for all instances to be available in Eureka.'
+            }
+            if (!awsEc2Service.checkHostsHealth(applicationInstances*.healthCheckUrl)) {
+                return 'Waiting for all instances to pass health checks.'
+            }
         }
-        if (applicationInstances.find { it.status != EurekaStatus.UP.name() }) {
-            return 'Waiting for all instances to be available in Eureka.'
+        if (asg.loadBalancerNames) {
+            String loadBalancerThatSeesOutOfServiceInstance = asg.loadBalancerNames.find {
+                if (asg.loadBalancerNames.size() > 1) { Time.sleepCancellably(250) }
+                awsLoadBalancerService.getInstanceStateDatas(userContext, it, [asg]).find {
+                    it.autoScalingGroupName == asg.autoScalingGroupName && it.state != LifecycleState.InService.name()
+                }
+            }
+            if (loadBalancerThatSeesOutOfServiceInstance) {
+                return 'Waiting for all instances to pass ELB health checks.'
+            }
         }
-        if (!awsEc2Service.checkHostsHealth(applicationInstances*.healthCheckUrl)) {
-            return 'Waiting for all instances to pass health checks.'
-        }
-        null
+        ''
     }
 
     /**
@@ -903,8 +909,9 @@ class AwsAutoScalingService implements CacheInitializer, InitializingBean {
 
     void setExpirationTime(UserContext userContext, String autoScalingGroupName, DateTime expirationTime,
                            Task existingTask = null) {
-        Map<String, String> tagNameValuePairs = [(TagNames.EXPIRATION_TIME): Time.format(expirationTime)]
-        createOrUpdateAutoScalingGroupTags(userContext, autoScalingGroupName, tagNameValuePairs, existingTask)
+        List<Tag> tags = []
+		tags.add(new Tag(key:TagNames.EXPIRATION_TIME, value:Time.format(expirationTime), propagateAtLaunch:false, resourceId:autoScalingGroupName, resourceType:"auto-scaling-group"))
+		updateTags(userContext, tags, autoScalingGroupName,  existingTask)        
     }
 
     void postponeExpirationTime(UserContext userContext, String autoScalingGroupName, Duration extraTime,
@@ -924,17 +931,15 @@ class AwsAutoScalingService implements CacheInitializer, InitializingBean {
     }
 
     void removeExpirationTime(UserContext userContext, String autoScalingGroupName, Task existingTask = null) {
-        deleteAutoScalingGroupTags(userContext, autoScalingGroupName, [TagNames.EXPIRATION_TIME], existingTask)
+		List<Tag> tags = []
+		tags.add(new Tag(key:TagNames.EXPIRATION_TIME, resourceId:autoScalingGroupName, resourceType:"auto-scaling-group"))
+		deleteTags(userContext, tags, autoScalingGroupName,  existingTask)
     }
 
     void createOrUpdateAutoScalingGroupTags(UserContext userContext, String autoScalingGroupName, Map<String,
                                     String> tagNameValuePairs, Task existingTask = null) {
 
-        // TODO: Re-enable this call after Amazon fixes bugs on their side and tell us it's safe again
 
-        /*
-
-        // Hopefully Amazon will eventually change CreateOrUpdateTagsRequest to take List<Tag> instead of List<String>
         List<String> tagStringsEqualDelimited = tagNameValuePairs.collect { "${it.key}=${it.value}".toString() }
 
         String suffix = tagNameValuePairs.size() == 1 ? '' : 's'
@@ -942,29 +947,32 @@ class AwsAutoScalingService implements CacheInitializer, InitializingBean {
         taskService.runTask(userContext, msg, { Task task ->
             CreateOrUpdateTagsRequest request = new CreateOrUpdateTagsRequest(autoScalingGroupName: autoScalingGroupName,
                     forceOverwriteTags: true, propagate: true, tags: tagStringsEqualDelimited)
+			CreateOrUpdateTagsRequest cr = new CreateOrUpdateTagsRequest()
+			cr.setTags(tagStringsEqualDelimited)
+			
             awsClient.by(userContext.region).createOrUpdateTags(request)
         }, Link.to(EntityType.autoScaling, autoScalingGroupName), existingTask)
 
-        */
+        
     }
-
-    void deleteAutoScalingGroupTags(UserContext userContext, String autoScalingGroupName, List<String> tagNames,
-                                   Task existingTask = null) {
-
-        // TODO: Re-enable this call after Amazon fixes bugs on their side and tell us it's safe again
-
-        /*
-
-        String suffix = tagNames.size() == 1 ? '' : 's'
-        String msg = "Delete tag${suffix} ${tagNames} on Auto Scaling Group on '${autoScalingGroupName}'"
-        taskService.runTask(userContext, msg, { Task task ->
-            DeleteTagsRequest request = new DeleteTagsRequest(autoScalingGroupName: autoScalingGroupName,
-                    tagsToDelete: tagNames)
-            awsClient.by(userContext.region).deleteTags(request)
-        }, Link.to(EntityType.autoScaling, autoScalingGroupName), existingTask)
-
-        */
-    }
+									
+	void updateTags(UserContext userContext, List<Tag> tags, String autoScalingGroupName, Task existingTask = null){
+		String msg = "Create tags on Auto Scaling Group on '${autoScalingGroupName}'"
+		taskService.runTask(userContext, msg, {Task task ->
+			CreateOrUpdateTagsRequest request = new CreateOrUpdateTagsRequest()
+			request.setTags(tags)
+			awsClient.by(userContext.region).createOrUpdateTags(request)
+		}, Link.to(EntityType.autoScaling, autoScalingGroupName), existingTask)
+	}
+	
+	void deleteTags(UserContext userContext, List<Tag> tags, String autoScalingGroupName, Task existingTask = null){
+		String msg = "Delete tags on Auto Scaling Group on '${autoScalingGroupName}'"
+		taskService.runTask(userContext, msg, {Task task ->
+			DeleteTagsRequest request = new DeleteTagsRequest()
+			request.setTags(tags)
+			awsClient.by(userContext.region).deleteTags(request)
+		}, Link.to(EntityType.autoScaling, autoScalingGroupName), existingTask)
+	}
 
     void deleteAutoScalingGroup(UserContext userContext, String name, AsgDeletionMode mode = AsgDeletionMode.ATTEMPT,
                                 Task existingTask = null) {

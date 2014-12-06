@@ -26,6 +26,9 @@ import groovy.transform.Canonical
 @Canonical
 class SwfWorkflowTags extends WorkflowTags {
 
+    /** Unique ID assigned by Asgard. It simplifies managing workflow executions if they have a single ID. */
+    String id
+
     /** A link that corresponds to the workflow for use in constructing an Asgard Task */
     Link link
 

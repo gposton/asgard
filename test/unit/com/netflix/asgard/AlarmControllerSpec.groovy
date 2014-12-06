@@ -73,9 +73,10 @@ class AlarmControllerSpec extends Specification {
         awsCloudWatchService.awsClient = new MultiRegionAwsClient({ mockAmazonCloudWatchClient })
         controller.awsCloudWatchService = awsCloudWatchService
 
-        final mockAwsSimpleDbService  = Mock(AwsSimpleDbService)
-        awsCloudWatchService.awsSimpleDbService = mockAwsSimpleDbService
-        mockAwsSimpleDbService.incrementAndGetSequenceNumber(_, _) >> { 1 }
+        final mockIdService  = Mock(IdService) {
+            nextId(_, _) >> '1'
+        }
+        awsCloudWatchService.idService = mockIdService
 
         final awsSnsService = Mock(AwsSnsService)
         controller.awsSnsService = awsSnsService
@@ -109,7 +110,8 @@ class AlarmControllerSpec extends Specification {
         0 * awsSnsService.getTopic(_, _)
 
         1 * awsAutoScalingService.getScalingPolicy(_, 'nflx_newton_client-v003-17') >> {
-            new ScalingPolicy(policyARN: 'arn:aws:autoscaling:policyArn', autoScalingGroupName: 'nflx_newton_client-v003')
+            new ScalingPolicy(policyARN: 'arn:aws:autoscaling:policyArn',
+                    autoScalingGroupName: 'nflx_newton_client-v003')
         }
         0 * awsAutoScalingService.getScalingPolicy(_, _)
 
@@ -192,6 +194,7 @@ class AlarmControllerSpec extends Specification {
         final mockAmazonCloudWatchClient = Mock(AmazonCloudWatch)
         mockAmazonCloudWatchClient.describeAlarms(_) >> { new DescribeAlarmsResult() }
         awsCloudWatchService.awsClient = new MultiRegionAwsClient({ mockAmazonCloudWatchClient })
+        awsCloudWatchService.taskService.idService = Mock(IdService)
         controller.awsCloudWatchService = awsCloudWatchService
 
         controller.params.with {
@@ -210,7 +213,8 @@ class AlarmControllerSpec extends Specification {
                         alarmName: 'scale-up-alarm-helloworld--scalingtest-v000-CPUUtilization-87',
                         comparisonOperator: 'GreaterThanThreshold', evaluationPeriods: 1, metricName: 'CPUUtilization',
                         namespace: 'AWS/EC2', period: 300, statistic: 'Average', threshold: 87, alarmActions: [],
-                        dimensions: [new Dimension(name: AlarmData.DIMENSION_NAME_FOR_ASG, value: 'helloworld--scalingtest-v000')]
+                        dimensions: [new Dimension(name: AlarmData.DIMENSION_NAME_FOR_ASG,
+                                value: 'helloworld--scalingtest-v000')]
                 )]
         ) }
 
@@ -218,7 +222,7 @@ class AlarmControllerSpec extends Specification {
                 alarmNames: ['scale-up-alarm-helloworld--scalingtest-v000-CPUUtilization-87']
         ))
 
-        0 * _._
+        0 * mockAmazonCloudWatchClient._
     }
 
 }

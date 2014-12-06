@@ -118,22 +118,22 @@
           <td class="name">VPC Zone Identifier:</td>
           <td class="value">${vpcZoneIdentifier}</td>
         </tr>
-        <g:render template="/common/showTags" model="[entity: group]"/>
+        <g:render template="/common/showTagsDetail" model="[entity: tags]" />
         <tr class="prop">
           <td class="name">AZ Rebalancing:</td>
           <td class="value">${azRebalanceStatus}</td>
         </tr>
         <tr class="prop">
           <td class="name">New Instance Launching:</td>
-          <td class="value'}">${launchStatus}</td>
+          <td class="value'}" id="launchStatus">${launchStatus}</td>
         </tr>
         <tr class="prop">
           <td class="name">Instance Terminating:</td>
-          <td class="value'}">${terminateStatus}</td>
+          <td class="value'}" id="terminateStatus">${terminateStatus}</td>
         </tr>
         <tr class="prop">
           <td class="name">Adding to Load Balancer:</td>
-          <td class="value'}">${addToLoadBalancerStatus}</td>
+          <td class="value'}" id="addToLoadBalancerStatus">${addToLoadBalancerStatus}</td>
         </tr>
         <g:if test="${isChaosMonkeyActive}">
           <tr class="prop">

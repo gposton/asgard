@@ -22,6 +22,8 @@ import com.amazonaws.services.autoscaling.model.LaunchConfiguration
 import com.amazonaws.services.autoscaling.model.ScalingPolicy
 import com.amazonaws.services.autoscaling.model.ScheduledUpdateGroupAction
 import com.amazonaws.services.autoscaling.model.SuspendedProcess
+import com.amazonaws.services.autoscaling.model.Tag
+import com.amazonaws.services.autoscaling.model.TagDescription
 import com.amazonaws.services.cloudwatch.model.MetricAlarm
 import com.amazonaws.services.ec2.model.AvailabilityZone
 import com.amazonaws.services.ec2.model.Image
@@ -169,6 +171,10 @@ class AutoScalingController {
             } as Map
             String clusterName = Relationships.clusterFromGroupName(name)
             boolean isChaosMonkeyActive = cloudReadyService.isChaosMonkeyActive(userContext.region)
+			
+			//Grab tag data and set for display
+			List<TagDescription> tags = group.getTags()
+			
             def details = [
                     instanceCount: instanceCount,
                     showPostponeButton: showPostponeButton,
@@ -193,7 +199,8 @@ class AutoScalingController {
                     subnetPurpose: subnetPurpose ?: null,
                     vpcZoneIdentifier: group.VPCZoneIdentifier,
                     isChaosMonkeyActive: isChaosMonkeyActive,
-                    chaosMonkeyEditLink: cloudReadyService.constructChaosMonkeyEditLink(userContext.region, appName)
+                    chaosMonkeyEditLink: cloudReadyService.constructChaosMonkeyEditLink(userContext.region, appName),
+					tags: tags
             ]
             withFormat {
                 html { return details }
@@ -254,6 +261,26 @@ class AutoScalingController {
                         'Chaos Monkey settings directly in Cloudready after ASG creation.'
             }
         }
+		// Auto Scaling Group Tags
+		List<Tag> asgTags = []
+			
+		if (params.tags) {
+			Map tags = [:]		
+
+			// The tags get funky when passed by the save chain
+			params.entrySet().findAll {
+				it.key.startsWith('tags.value')
+			}.each {
+				tags.put(it.key.tokenize('.')[2], it.value)				
+			}
+		
+			if (tags.size() > 0){
+					tags.each { key, value ->
+						Tag t = new Tag(key:key, value:value, propagateAtLaunch:params['tags.props.' + key] == 'on' ? true:false)
+						asgTags.add(t)
+				}
+			}									
+		}
         [
                 applications: applicationService.getRegisteredApplications(userContext),
                 group: group,
@@ -277,7 +304,8 @@ class AutoScalingController {
                 iamInstanceProfile: configService.defaultIamRole,
                 spotUrl: configService.spotUrl,
                 isChaosMonkeyActive: cloudReadyService.isChaosMonkeyActive(userContext.region),
-                appsWithClusterOptLevel: appsWithClusterOptLevel ?: []
+                appsWithClusterOptLevel: appsWithClusterOptLevel ?: [],
+				tags: asgTags
         ]
     }
 
@@ -287,14 +315,24 @@ class AutoScalingController {
 
     def save = { GroupCreateCommand cmd ->
         if (cmd.hasErrors()) {
-            chain(action: 'create', model: [cmd:cmd], params: params) // Use chain to pass both the errors and params
+            chain(action: 'create', model: [cmd: cmd], params: params) // Use chain to pass both the errors and params
         } else {
             UserContext userContext = UserContext.of(request)
             // Auto Scaling Group name
             String groupName = Relationships.buildGroupName(params)
             Subnets subnets = awsEc2Service.getSubnets(userContext)
             String subnetPurpose = params.subnetPurpose ?: null
-            String vpcId = subnets.mapPurposeToVpcId()[subnetPurpose] ?: ''
+            String vpcId = subnets.getVpcIdForSubnetPurpose(subnetPurpose) ?: ''
+
+			// Auto Scaling Group Tags
+			List<Tag> asgTags = []
+			
+			if (params.tags) {
+				params.tags.value.each { key, value ->
+					Tag t = new Tag(key:key, value:value, propagateAtLaunch:params['tags.props.' + key] == 'on' ? true:false, resourceId:groupName, resourceType:"auto-scaling-group")
+					asgTags.add(t)
+				}
+			}
 
             // Auto Scaling Group
             Integer minSize = (params.min ?: 0) as Integer
@@ -313,7 +351,7 @@ class AutoScalingController {
                     withMinSize(minSize).withDesiredCapacity(desiredCapacity).
                     withMaxSize(maxSize).withDefaultCooldown(defaultCooldown).
                     withHealthCheckType(healthCheckType).withHealthCheckGracePeriod(healthCheckGracePeriod).
-                    withTerminationPolicies(terminationPolicies)
+                    withTerminationPolicies(terminationPolicies).withTags(asgTags)
 
             // If this ASG lauches VPC instances, we must find the proper subnets and add them.
             if (subnetPurpose) {
@@ -387,6 +425,7 @@ class AutoScalingController {
                 addToLoadBalancerSuspended: group?.isProcessSuspended(AutoScalingProcessType.AddToLoadBalancer),
                 manualStaticSizingNeeded: manualStaticSizingNeeded,
                 vpcZoneIdentifier: group.VPCZoneIdentifier,
+				tags: group.tags,
         ]
     }
 
@@ -429,6 +468,31 @@ class AutoScalingController {
                 resumeProcesses << processType
             }
         }
+			List<Tag> tags = []
+			
+			if (params.tags) {
+				params.tags.value.each { key, value ->
+					Tag t = new Tag(key:key, value:value, propagateAtLaunch:params['tags.props.' + key] == 'on' ? true:false, resourceId:name, resourceType:"auto-scaling-group")
+					tags.add(t)
+				}
+				
+				if (tags.size() > 0){
+					awsAutoScalingService.updateTags(userContext, tags, name)
+				}
+			
+				tags = []
+				params.tags.delete.each { key, value ->
+					if (value == 'on'){
+						Tag t = new Tag(key:key, value:params['tags.values.' + key], propagateAtLaunch:params['tags.props.' + key] == 'on' ? true:false, resourceId:name, resourceType:"auto-scaling-group")
+						tags.add(t)
+					}
+				}
+				
+				if (tags.size() > 0){
+					awsAutoScalingService.deleteTags(userContext, tags, name)
+				}
+			}
+													
         final AutoScalingGroupData autoScalingGroupData = AutoScalingGroupData.forUpdate(
                 name, lcName, minSize, desiredCapacity, maxSize, defaultCooldown, healthCheckType,
                 healthCheckGracePeriod, terminationPolicies, availabilityZones

@@ -55,14 +55,8 @@
             <tr class="${(i % 2) == 0 ? 'odd' : 'even'}">
               <td><g:radio name="id" value="${rti.id}"/></td>
               <td>
-                <g:if test="${rti.runId}">
-                  <g:link class="task" action="show" params="[runId: rti.runId, workflowId: rti.workflowId]"
-                          title="Show details of this task">${rti.name}</g:link>
-                </g:if>
-                <g:else>
-                  <g:link class="task" action="show" params="[id: rti.id]"
-                          title="Show details of this task">${rti.name}</g:link>
-                </g:else>
+                <g:link class="task" action="show" params="[id: rti.id]"
+                        title="Show details of this task">${rti.name}</g:link>
               </td>
               <td>${rti.userContext?.region}</td>
               <td><g:formatDate date="${rti.startTime}"/></td>
@@ -80,8 +74,7 @@
           </tbody>
         </table>
       </div>
-      <div class="paginateButtons">
-      </div>
+      <footer/>
     </g:form>
   </div>
   <div class="body">
@@ -110,14 +103,8 @@
           <tr class="${(i % 2) == 0 ? 'odd' : 'even'}">
             <td><g:radio name="id" value="${cti.id}"/></td>
             <td>
-              <g:if test="${cti.runId}">
-                <g:link class="task" action="show" params="[runId: cti.runId, workflowId: cti.workflowId]"
-                    title="Show details of this task">${cti.name}</g:link>
-              </g:if>
-              <g:else>
-                <g:link class="task" action="show" params="[id: cti.id]"
-                        title="Show details of this task">${cti.name}</g:link>
-              </g:else>
+              <g:link class="task" action="show" params="${cti.id ? [id: cti.id] : [runId: cti.workflowExecution.runId]}"
+                      title="Show details of this task">${cti.name}</g:link>
             </td>
             <td>${cti.userContext?.region}</td>
             <td><g:formatDate date="${cti.startTime}"/></td>
@@ -134,8 +121,7 @@
         </tbody>
       </table>
     </div>
-    <div class="paginateButtons">
-    </div>
+    <footer/>
   </div>
 </body>
 </html>

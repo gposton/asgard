@@ -22,10 +22,13 @@ import com.amazonaws.services.simpleworkflow.model.WorkflowExecution
 import com.netflix.asgard.AwsAutoScalingService
 import com.netflix.asgard.AwsEc2Service
 import com.netflix.asgard.AwsLoadBalancerService
+import com.netflix.asgard.AwsSimpleWorkflowService
 import com.netflix.asgard.ConfigService
 import com.netflix.asgard.DiscoveryService
 import com.netflix.asgard.EmailerService
 import com.netflix.asgard.LaunchTemplateService
+import com.netflix.asgard.NoOpAsgAnalyzer
+import com.netflix.asgard.PluginService
 import com.netflix.asgard.Region
 import com.netflix.asgard.UserContext
 import com.netflix.asgard.model.AutoScalingGroupBeanOptions
@@ -33,8 +36,10 @@ import com.netflix.asgard.model.AutoScalingGroupData
 import com.netflix.asgard.model.AutoScalingProcessType
 import com.netflix.asgard.model.LaunchConfigurationBeanOptions
 import com.netflix.asgard.model.ScalingPolicyData
+import com.netflix.asgard.model.SwfWorkflowTags
+import com.netflix.asgard.model.WorkflowExecutionBeanOptions
+import com.netflix.asgard.plugin.AsgAnalyzer
 import com.netflix.asgard.push.Cluster
-import com.netflix.asgard.push.PushException
 import com.netflix.glisten.ActivityOperations
 import org.codehaus.groovy.grails.web.mapping.LinkGenerator
 import spock.lang.Specification
@@ -52,11 +57,15 @@ class DeploymentActivitiesSpec extends Specification {
     EmailerService mockEmailerService = Mock(EmailerService)
     ActivityOperations mockActivityOperations = Mock(ActivityOperations)
     LinkGenerator mockLinkGenerator = Mock(LinkGenerator)
+    AwsSimpleWorkflowService mockAwsSimpleWorkflowService = Mock(AwsSimpleWorkflowService)
+    PluginService mockPluginService = Mock(PluginService)
     DeploymentActivities deploymentActivities = new DeploymentActivitiesImpl(
             awsAutoScalingService: mockAwsAutoScalingService, awsEc2Service: mockAwsEc2Service,
             launchTemplateService: mockLaunchTemplateService, configService: mockConfigService,
             discoveryService: mockDiscoveryService, awsLoadBalancerService: mockAwsLoadBalancerService,
-            emailerService: mockEmailerService, activity: mockActivityOperations, grailsLinkGenerator: mockLinkGenerator)
+            emailerService: mockEmailerService, activity: mockActivityOperations,
+            grailsLinkGenerator: mockLinkGenerator, awsSimpleWorkflowService: mockAwsSimpleWorkflowService,
+            pluginService: mockPluginService)
 
     AsgDeploymentNames asgDeploymentNames = new AsgDeploymentNames(
             previousAsgName: 'rearden_metal_pourer-v001',
@@ -113,23 +122,9 @@ class DeploymentActivitiesSpec extends Specification {
         }
     }
 
-    def 'should construct next ASG'() {
-        AutoScalingGroupBeanOptions expectedAsg = new AutoScalingGroupBeanOptions(minSize: 0, maxSize: 6,
-                desiredCapacity: 0, defaultCooldown: 200, healthCheckGracePeriod: 60,
-                autoScalingGroupName: 'rearden_metal_pourer-v002',
-                launchConfigurationName: 'rearden_metal_pourer-20130718090004',
-                suspendedProcesses: [AutoScalingProcessType.AlarmNotifications] as Set)
-
-        expect:
-        deploymentActivities.constructNextAsgForCluster(userContext, asgDeploymentNames,
-                new AutoScalingGroupBeanOptions(minSize: 4, maxSize: 6, defaultCooldown: 200,
-                        healthCheckGracePeriod: 60, suspendedProcesses: [AutoScalingProcessType.AlarmNotifications])
-        ) == expectedAsg
-    }
-
     def 'should create next ASG'() {
         when:
-        deploymentActivities.createNextAsgForCluster(userContext, new AutoScalingGroupBeanOptions(
+        deploymentActivities.createNextAsgForClusterWithoutInstances(userContext, new AutoScalingGroupBeanOptions(
                 autoScalingGroupName: 'rearden_metal_pourer-v002',
                 launchConfigurationName: 'rearden_metal_pourer-20130718090004',
                 minSize: 4, desiredCapacity: 5, maxSize: 6, defaultCooldown: 200, healthCheckGracePeriod: 60,
@@ -140,7 +135,7 @@ class DeploymentActivitiesSpec extends Specification {
             1 * createAutoScalingGroup(_, new AutoScalingGroupBeanOptions(
                     autoScalingGroupName: 'rearden_metal_pourer-v002',
                     launchConfigurationName: 'rearden_metal_pourer-20130718090004',
-                    minSize: 4, desiredCapacity: 5, maxSize: 6, defaultCooldown: 200, healthCheckGracePeriod: 60,
+                    minSize: 0, desiredCapacity: 0, maxSize: 6, defaultCooldown: 200, healthCheckGracePeriod: 60,
                     suspendedProcesses: [AutoScalingProcessType.Launch]
             ), _) >> new AutoScalingGroup(autoScalingGroupName: 'rearden_metal_pourer-v002')
         }
@@ -187,16 +182,15 @@ class DeploymentActivitiesSpec extends Specification {
         }
     }
 
-    def 'should throw a reason if ASG is unhealthy'() {
+    def 'should give a reason if ASG is unhealthy'() {
         when:
-        deploymentActivities.reasonAsgIsUnhealthy(userContext, 'rearden_metal_pourer-v001', 2)
+        String reason = deploymentActivities.reasonAsgIsNotOperational(userContext, 'rearden_metal_pourer-v001', 2)
 
         then:
         with(mockAwsAutoScalingService) {
-            1 * reasonAsgIsUnhealthy(_, 'rearden_metal_pourer-v001', 2) >> 'Who is John Galt?'
+            1 * reasonAsgIsNotOperational(_, 'rearden_metal_pourer-v001', 2) >> 'Who is John Galt?'
         }
-        PushException exception = thrown()
-        exception.message == 'Who is John Galt?'
+        reason == 'Who is John Galt?'
     }
 
     def 'should enable an ASG'() {
@@ -279,7 +273,7 @@ class DeploymentActivitiesSpec extends Specification {
     def 'should ask if deployment should proceed'() {
         when:
         deploymentActivities.askIfDeploymentShouldProceed('hrearden@reardenmetal.com', 'rearden_metal_pourer-v001',
-                'It has finished pouring.', null)
+                'It has finished pouring.')
 
         then:
         with(mockActivityOperations) {
@@ -295,7 +289,6 @@ class DeploymentActivitiesSpec extends Specification {
                     '''
                     Auto Scaling Group \'rearden_metal_pourer-v001\' is being deployed.
                     It has finished pouring.
-                    Auto Scaling Group \'rearden_metal_pourer-v001\' is healthy.
                     Please determine if the deployment should proceed.
 
                     <link>
@@ -303,6 +296,12 @@ class DeploymentActivitiesSpec extends Specification {
         }
         with(mockConfigService) {
             1 * getLinkCanonicalServerUrl() >> 'http://asgard'
+        }
+        with(mockAwsSimpleWorkflowService) {
+            1 * getWorkflowExecutionInfoByWorkflowExecution(new WorkflowExecution(runId: '123', workflowId: 'abc')) >>
+                    Mock(WorkflowExecutionBeanOptions) {
+                getTags() >> new SwfWorkflowTags(id: 1)
+            }
         }
         0 * _
     }
@@ -321,18 +320,36 @@ class DeploymentActivitiesSpec extends Specification {
             1 * link(_) >> '<link>'
         }
         with(mockEmailerService) {
-            1 * sendUserEmail('hrearden@reardenmetal.com',
-                    'Read this Hank!',
-                    '''
-                    Auto Scaling Group \'rearden_metal_pourer-v001\' is unhealthy. Production has halted.
-
-                    <link>
-                    '''.stripIndent())
+            1 * sendUserEmail('hrearden@reardenmetal.com', 'Read this Hank!', '''\
+            Production has halted.
+            <link>'''.stripIndent())
         }
         with(mockConfigService) {
             1 * getLinkCanonicalServerUrl() >> 'http://asgard'
         }
         0 * _
+    }
+
+    void 'should start ASG Analysis'() {
+        AsgAnalyzer asgAnalyzer = Spy(NoOpAsgAnalyzer)
+
+        when:
+        deploymentActivities.startAsgAnalysis('fakeblock', 'gmaharis@faceblock.com')
+
+        then:
+        1 * mockPluginService.getAsgAnalyzer() >> asgAnalyzer
+        1 * asgAnalyzer.startAnalysis('fakeblock', 'gmaharis@faceblock.com')
+    }
+
+    void 'should stop ASG Analysis'() {
+        AsgAnalyzer asgAnalyzer = Spy(NoOpAsgAnalyzer)
+
+        when:
+        deploymentActivities.stopAsgAnalysis('fakeblock')
+
+        then:
+        1 * mockPluginService.getAsgAnalyzer() >> asgAnalyzer
+        1 * asgAnalyzer.stopAnalysis('fakeblock')
     }
 
 }

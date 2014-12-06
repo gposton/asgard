@@ -18,16 +18,17 @@ package com.netflix.asgard.deployment
 import com.amazonaws.services.autoscaling.model.AutoScalingGroup
 import com.amazonaws.services.autoscaling.model.ScheduledUpdateGroupAction
 import com.amazonaws.services.simpleworkflow.flow.annotations.ManualActivityCompletion
-import com.amazonaws.services.simpleworkflow.model.WorkflowExecution
 import com.netflix.asgard.AwsAutoScalingService
 import com.netflix.asgard.AwsEc2Service
 import com.netflix.asgard.AwsLoadBalancerService
+import com.netflix.asgard.AwsSimpleWorkflowService
 import com.netflix.asgard.Caches
 import com.netflix.asgard.CloudReadyService
 import com.netflix.asgard.ConfigService
 import com.netflix.asgard.DiscoveryService
 import com.netflix.asgard.EmailerService
 import com.netflix.asgard.LaunchTemplateService
+import com.netflix.asgard.PluginService
 import com.netflix.asgard.Relationships
 import com.netflix.asgard.Task
 import com.netflix.asgard.Time
@@ -37,10 +38,12 @@ import com.netflix.asgard.model.AutoScalingGroupData
 import com.netflix.asgard.model.AutoScalingProcessType
 import com.netflix.asgard.model.LaunchConfigurationBeanOptions
 import com.netflix.asgard.model.ScalingPolicyData
+import com.netflix.asgard.model.ScheduledAsgAnalysis
+import com.netflix.asgard.model.SwfWorkflowTags
+import com.netflix.asgard.model.WorkflowExecutionBeanOptions
 import com.netflix.asgard.push.AsgDeletionMode
-import com.netflix.asgard.push.PushException
 import com.netflix.glisten.ActivityOperations
-import com.netflix.glisten.SwfActivityOperations
+import com.netflix.glisten.impl.swf.SwfActivityOperations
 import org.codehaus.groovy.grails.web.mapping.LinkGenerator
 
 class DeploymentActivitiesImpl implements DeploymentActivities {
@@ -50,12 +53,14 @@ class DeploymentActivitiesImpl implements DeploymentActivities {
     AwsAutoScalingService awsAutoScalingService
     AwsEc2Service awsEc2Service
     AwsLoadBalancerService awsLoadBalancerService
+    AwsSimpleWorkflowService awsSimpleWorkflowService
     Caches caches
     CloudReadyService cloudReadyService
     ConfigService configService
     DiscoveryService discoveryService
     EmailerService emailerService
     LaunchTemplateService launchTemplateService
+    PluginService pluginService
     LinkGenerator grailsLinkGenerator
 
     @Override
@@ -68,19 +73,6 @@ class DeploymentActivitiesImpl implements DeploymentActivities {
                 nextAsgName: nextAsgName,
                 nextLaunchConfigName: Relationships.buildLaunchConfigurationName(nextAsgName)
         )
-    }
-
-    @Override
-    AutoScalingGroupBeanOptions constructNextAsgForCluster(UserContext userContext, AsgDeploymentNames asgDeploymentNames,
-            AutoScalingGroupBeanOptions inputs) {
-        AutoScalingGroupBeanOptions autoScalingGroup = AutoScalingGroupBeanOptions.from(inputs)
-        autoScalingGroup.with {
-            autoScalingGroupName = asgDeploymentNames.nextAsgName
-            launchConfigurationName = asgDeploymentNames.nextLaunchConfigName
-            minSize = 0
-            desiredCapacity = 0
-        }
-        autoScalingGroup
     }
 
     @Override
@@ -105,10 +97,15 @@ class DeploymentActivitiesImpl implements DeploymentActivities {
     }
 
     @Override
-    String createNextAsgForCluster(UserContext userContext, AutoScalingGroupBeanOptions autoScalingGroup) {
+    String createNextAsgForClusterWithoutInstances(UserContext userContext, AutoScalingGroupBeanOptions asgOptions) {
         Task task = new Task()
+        AutoScalingGroupBeanOptions autoScalingGroupWithNoInstances = AutoScalingGroupBeanOptions.from(asgOptions)
+        autoScalingGroupWithNoInstances.with {
+            minSize = 0
+            desiredCapacity = 0
+        }
         AutoScalingGroup resultingAutoScalingGroup = awsAutoScalingService.createAutoScalingGroup(userContext,
-                autoScalingGroup, task)
+                autoScalingGroupWithNoInstances, task)
         resultingAutoScalingGroup?.autoScalingGroupName
     }
 
@@ -136,12 +133,8 @@ class DeploymentActivitiesImpl implements DeploymentActivities {
     }
 
     @Override
-    String reasonAsgIsUnhealthy(UserContext userContext, String asgName, int expectedSize) {
-        String reasonAsgIsUnhealthy = awsAutoScalingService.reasonAsgIsUnhealthy(userContext, asgName, expectedSize)
-        if (reasonAsgIsUnhealthy) {
-            throw new PushException(reasonAsgIsUnhealthy)
-        }
-        null
+    String reasonAsgIsNotOperational(UserContext userContext, String asgName, int expectedSize) {
+        awsAutoScalingService.reasonAsgIsNotOperational(userContext, asgName, expectedSize)
     }
 
     @Override
@@ -202,18 +195,17 @@ class DeploymentActivitiesImpl implements DeploymentActivities {
 
     @ManualActivityCompletion
     @Override
-    Boolean askIfDeploymentShouldProceed(String notificationDestination, String asgName, String operationDescription,
-            String reasonAsgIsUnhealthy) {
-        WorkflowExecution workflowExecution = activity.workflowExecution
+    Boolean askIfDeploymentShouldProceed(String notificationDestination, String asgName, String operationDescription) {
+        WorkflowExecutionBeanOptions workflowExecutionBeanOptions = awsSimpleWorkflowService.
+                getWorkflowExecutionInfoByWorkflowExecution(activity.workflowExecution)
+        SwfWorkflowTags tags = workflowExecutionBeanOptions.tags
         String message = """
         Auto Scaling Group '${asgName}' is being deployed.
         ${operationDescription}
-        ${getStatusText(asgName, reasonAsgIsUnhealthy)}
         Please determine if the deployment should proceed.
 
         ${grailsLinkGenerator.link(base: configService.linkCanonicalServerUrl, controller: 'task', action: 'show',
-                params: [workflowId: workflowExecution.workflowId, runId: workflowExecution.runId,
-                        taskToken: activity.taskToken])}
+                params: [id: tags.id, taskToken: activity.taskToken])}
         """.stripIndent()
         String subject = "Asgard deployment response requested for '${asgName}'."
         emailerService.sendUserEmail(notificationDestination, subject, message)
@@ -221,19 +213,22 @@ class DeploymentActivitiesImpl implements DeploymentActivities {
     }
 
     @Override
-    void sendNotification(String notificationDestination, String asgName, String subject, String reasonAsgIsUnhealthy) {
-        String clusterName = Relationships.clusterFromGroupName(asgName)
-        String message = """
-        ${getStatusText(asgName, reasonAsgIsUnhealthy)}
-
+    void sendNotification(String notificationDestination, String clusterName, String subject, String message) {
+        String messageWithLink = """\
+        ${message}
         ${grailsLinkGenerator.link(base: configService.linkCanonicalServerUrl, controller: 'cluster', action: 'show',
-                id: clusterName)}
-        """.stripIndent()
-        emailerService.sendUserEmail(notificationDestination, subject, message)
+                id: clusterName)}""".stripIndent()
+        emailerService.sendUserEmail(notificationDestination, subject, messageWithLink)
     }
 
-    private String getStatusText(String asgName, String reasonAsgIsUnhealthy) {
-        String status = reasonAsgIsUnhealthy ? "unhealthy. ${reasonAsgIsUnhealthy}" : 'healthy.'
-        "Auto Scaling Group '${asgName}' is ${status}"
+    @Override
+    ScheduledAsgAnalysis startAsgAnalysis(String clusterName, String notificationDestination) {
+        pluginService.asgAnalyzer.startAnalysis(clusterName, notificationDestination)
     }
+
+    @Override
+    void stopAsgAnalysis(String name) {
+        pluginService.asgAnalyzer.stopAnalysis(name)
+    }
+
 }

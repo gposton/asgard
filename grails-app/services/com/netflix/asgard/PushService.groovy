@@ -17,6 +17,7 @@ package com.netflix.asgard
 
 import com.amazonaws.services.autoscaling.model.AutoScalingGroup
 import com.amazonaws.services.autoscaling.model.LaunchConfiguration
+import com.amazonaws.services.autoscaling.model.TagDescription
 import com.amazonaws.services.ec2.model.Image
 import com.amazonaws.services.ec2.model.SecurityGroup
 import com.netflix.asgard.model.InstancePriceType
@@ -133,6 +134,7 @@ class PushService {
         if (!group) {
             throw new NoSuchObjectException("Auto scaling group '${name}' not found")
         }
+		List<TagDescription> tags = group.getTags()
         Integer relaunchCount = group.instances.size()
         LaunchConfiguration lc = awsAutoScalingService.getLaunchConfiguration(userContext,
                 group.launchConfigurationName)
@@ -147,14 +149,14 @@ class PushService {
         Boolean imageListIsShort = images.size() < fullCount
         Subnets subnets = awsEc2Service.getSubnets(userContext)
         List<SecurityGroup> effectiveSecurityGroups = awsEc2Service.getEffectiveSecurityGroups(userContext)
-        List<String> subnetIds = Relationships.subnetIdsFromVpcZoneIdentifier(group.VPCZoneIdentifier)
-        String vpcId = subnets.coerceLoneOrNoneFromIds(subnetIds)?.vpcId
+        String vpcId = subnets.getVpcIdForVpcZoneIdentifier(group.VPCZoneIdentifier)
         Map<String, String> purposeToVpcId = subnets.mapPurposeToVpcId()
         String pricing = lc.spotPrice ? InstancePriceType.SPOT.name() : InstancePriceType.ON_DEMAND.name()
         Map<String, Object> result = [
                 appName: appName,
                 name: name,
                 cluster: Relationships.clusterFromGroupName(name),
+				tags: tags,
                 variables: Relationships.parts(name),
                 actionName: actionName,
                 allTerminationPolicies: awsAutoScalingService.terminationPolicyTypes,

@@ -21,16 +21,15 @@ import com.amazonaws.services.simpleworkflow.flow.ManualActivityCompletionClient
 import com.amazonaws.services.simpleworkflow.flow.WorkflowClientExternal
 import com.amazonaws.services.simpleworkflow.model.WorkflowExecution
 import com.netflix.glisten.InterfaceBasedWorkflowClient
-import com.netflix.glisten.WorkflowClientExternalToWorkflowInterfaceAdapter
 import com.netflix.glisten.WorkflowClientFactory
 import com.netflix.glisten.example.trip.BayAreaTripWorkflow
+import com.netflix.glisten.impl.swf.WorkflowClientExternalToWorkflowInterfaceAdapter
 import spock.lang.Specification
 
 class FlowServiceUnitSpec extends Specification {
 
     WorkflowClientFactory workflowClientFactory = new WorkflowClientFactory(Mock(AmazonSimpleWorkflow))
     FlowService flowService = new FlowService(workflowClientFactory: workflowClientFactory)
-
 
     def 'should get new workflow client'() {
         UserContext userContext = new UserContext(username: 'rtargaryen')
@@ -41,6 +40,7 @@ class FlowServiceUnitSpec extends Specification {
                 '{"user":{"ticket":null,"username":"rtargaryen","clientHostName":null,"clientIpAddress":null,\
 "region":null,"internalAutomation":null}}'
         ]
+        flowService.idService = Mock(IdService)
 
         when:
         def client = flowService.getNewWorkflowClient(userContext, BayAreaTripWorkflow, link)
@@ -72,5 +72,4 @@ class FlowServiceUnitSpec extends Specification {
         expect:
         flowService.getManualActivityCompletionClient('123') instanceof ManualActivityCompletionClient
     }
-
 }
